@@ -5,8 +5,9 @@ from functools import lru_cache
 
 import numpy as np
 import pandas as pd
-from fitparse import FitFile
-from fitparse.utils import FitHeaderError
+import fitdecode
+from fitdecode import FitReader
+from fitdecode.exceptions import FitHeaderError
 
 from .exceptions import InvalidFitFile
 from .models import Athlete
@@ -58,6 +59,7 @@ def read_fit(
     summaries: bool = False,
     metadata: bool = False,
     raw_messages: bool = False,
+    unknown_messages: bool = False,
     fitparse_kwargs=None,
 ) -> pd.DataFrame:
     """This method uses the Python fitparse library to load a FIT file into a Pandas DataFrame.
@@ -73,10 +75,11 @@ def read_fit(
         summaries: whether to return session summary data. Note: If set to True this method will return a dictionairy instead of a data frame.
         metadata: whether to return metadata. Note: If set to True this method will return a dictionairy instead of a data frame.
         fitparse_kwargs: keyword arguments to pass the the python-fitparse FitFile class. Defaults to {"check_crc": False}
+        unknown_messages: whether to return unknown messages. Note: If set to true this method will return a dictionary instead of a data frame.
         raw_messages: Whether to return the raw FIT messages as a list of dictionaries. If set to True this method will return a dictionairy with a "raw_messages" key instead of a data frame.
 
     Returns:
-        A pandas data frame with all the data or a dictionairy when either hrv, summaries or metadata are True.
+        A pandas data frame with all the data or a dictionary when either hrv, summaries, metadata, or unknown_messages are True.
     """
 
     if isinstance(fpath, pathlib.PurePath):
@@ -90,7 +93,7 @@ def read_fit(
         fitparse_kwargs = {**default_fitparse_kwargs, **fitparse_kwargs}
 
     try:
-        fitfile = FitFile(fpath, **fitparse_kwargs)
+        fitfile = FitReader(fpath, **fitparse_kwargs)
     except FitHeaderError as e:
         raise InvalidFitFile(f"Invalid FIT file: {str(e)}")
 
@@ -104,86 +107,93 @@ def read_fit(
     rr_intervals = []
     pool_length_records = []
     raw_message_records = []
+    unknown_message_records = []
     user_profile = None
     zones_target = None
     record_sequence = 0
-    for record in fitfile.get_messages():
-        try:
-            mesg_type = record.mesg_type.name
-        except AttributeError:
-            continue
+    for record in fitfile:
+        if record.frame_type == fitdecode.FIT_FRAME_DATA:
+            try:
+                mesg_type = record.mesg_type.name
+            except AttributeError:
+                mesg_type = record.global_mesg_num
 
-        if raw_messages:
-            raw_message_records.append(record.get_values())
+            fields = record.fields
+            raw = {f.name if f.name else f.def_num: f.value for f in fields}
 
-        if mesg_type == "record":
-            values = record.get_values()
-            values["sport"] = sport
-            values["record_sequence"] = record_sequence
-            records.append(values)
-            record_sequence += 1
-        elif mesg_type == "device_info":
-            device = record.get_values()
-            serial_number = device.get("serial_number", None)
-            if serial_number is not None:
-                devices[serial_number] = device
-            continue
-        elif mesg_type == "file_id":
-            continue
-        elif mesg_type == "file_creator":
-            continue
-        elif mesg_type == "device_settings":
-            continue
-        elif mesg_type == "user_profile" and metadata:
-            user_profile = record.get_values()
-        elif mesg_type == "zones_target" and metadata:
-            zones_target = record.get_values()
-        elif mesg_type == "developer_data_id":
-            continue
-        elif mesg_type == "field_description":
-            continue
-        elif mesg_type == "activity":
-            activity_summary = record.get_values()
-        elif mesg_type == "lap":
-            lap_summary = {}
-            for field in record.fields:
-                if lap_summary.get(field.name, None) is None:
-                    lap_summary[field.name] = field.value
-            lap_summaries.append(lap_summary)
-        elif mesg_type == "event":
-            if record.get_value("event_type") == "start":
-                # This happens whens an activity is (manually or automatically) paused or stopped and the resumed
-                # @TODO Decide how to handle this with respect to laps and sessions
+            if raw_messages:
+                raw_message_records.append(raw)
+
+            if mesg_type == "record":
+                values = raw
+                values["sport"] = sport
+                values["record_sequence"] = record_sequence
+                records.append(values)
+                record_sequence += 1
+            elif mesg_type == "device_info":
+                device = raw
+                serial_number = device.get("serial_number", None)
+                if serial_number is not None:
+                    devices[serial_number] = device
                 continue
-        elif mesg_type == "sport":
-            sport_record = record.get_values()
-            sport = record.get_value("sport")
-        elif mesg_type == "hrv":
-            if hrv:
-                values = record.get_values()["time"]
-                if values is None:
+            elif mesg_type == "file_id":
+                continue
+            elif mesg_type == "file_creator":
+                continue
+            elif mesg_type == "device_settings":
+                continue
+            elif mesg_type == "user_profile" and metadata:
+                user_profile = raw
+            elif mesg_type == "zones_target" and metadata:
+                zones_target = raw
+            elif mesg_type == "developer_data_id":
+                continue
+            elif mesg_type == "field_description":
+                continue
+            elif mesg_type == "activity":
+                activity_summary = raw
+            elif mesg_type == "lap":
+                lap_summary = {}
+                for field in record.fields:
+                    if lap_summary.get(field.name, None) is None:
+                        lap_summary[field.name] = field.value
+                lap_summaries.append(lap_summary)
+            elif mesg_type == "event":
+                if record.get_value("event_type") == "start":
+                    # This happens whens an activity is (manually or automatically) paused or stopped and the resumed
+                    # @TODO Decide how to handle this with respect to laps and sessions
                     continue
+            elif mesg_type == "sport":
+                sport_record = raw
+                sport = record.get_value("sport")
+            elif mesg_type == "hrv":
+                if hrv:
+                    values = raw["time"]
+                    if values is None:
+                        continue
 
-                if not isinstance(values, Iterable):
-                    values = [values]
+                    if not isinstance(values, Iterable):
+                        values = [values]
 
-                for val in values:
-                    if val is not None:
-                        rr_intervals.append(val)
-        elif mesg_type == "hr":
-            # @TODO Decide wether to use these
-            continue
-        elif mesg_type == "session":
-            session_summary = {}
-            for field in record.fields:
-                if session_summary.get(field.name, None) is None:
-                    session_summary[field.name] = field.value
-            session_summaries.append(session_summary)
-        elif mesg_type == "length":
-            if pool_lengths:
-                pool_length_records.append(record.get_values())
-        else:
-            continue
+                    for val in values:
+                        if val is not None:
+                            rr_intervals.append(val)
+            elif mesg_type == "hr":
+                # @TODO Decide wether to use these
+                continue
+            elif mesg_type == "session":
+                session_summary = {}
+                for field in record.fields:
+                    if session_summary.get(field.name, None) is None:
+                        session_summary[field.name] = field.value
+                session_summaries.append(session_summary)
+            elif mesg_type == "length":
+                if pool_lengths:
+                    pool_length_records.append(raw)
+            else:
+                if unknown_messages:
+                    unknown_message_records.append({"type": mesg_type, "raw_type": record.mesg_type, "record": raw})
+
 
     fit_df = pd.DataFrame(records)
 
@@ -270,6 +280,7 @@ def read_fit(
         and not summaries
         and not metadata
         and not raw_messages
+        and not unknown_messages
     ):
         return fit_df
 
@@ -301,6 +312,9 @@ def read_fit(
 
     if raw_messages:
         return_value["raw_messages"] = raw_message_records
+
+    if unknown_messages:
+        return_value["unknown_messages"] = unknown_message_records
 
     return return_value
 
