@@ -61,6 +61,7 @@ def read_fit(
     raw_messages: bool = False,
     unknown_messages: bool = False,
     fitparse_kwargs=None,
+    debug=False,
 ) -> pd.DataFrame:
     """This method uses the Python fitparse library to load a FIT file into a Pandas DataFrame.
     It is tested with a Garmin FIT file but will probably work with other FIT files too.
@@ -108,10 +109,19 @@ def read_fit(
     pool_length_records = []
     raw_message_records = []
     unknown_message_records = []
+    sport_records = []
     user_profile = None
     zones_target = None
     record_sequence = 0
     for record in fitfile:
+        if debug:
+            if record.frame_type == fitdecode.FIT_FRAME_DEFINITION:
+                print(f"FitDefinitionMessage: {record.global_mesg_num}")
+                for field in record.all_field_defs:
+                    try:
+                        print(field.field.name)
+                    except Exception:
+                        print(field)
         if record.frame_type == fitdecode.FIT_FRAME_DATA:
             try:
                 mesg_type = record.mesg_type.name
@@ -165,6 +175,7 @@ def read_fit(
                     continue
             elif mesg_type == "sport":
                 sport_record = raw
+                sport_records.append(sport_record)
                 sport = record.get_value("sport")
             elif mesg_type == "hrv":
                 if hrv:
@@ -192,10 +203,11 @@ def read_fit(
                     pool_length_records.append(raw)
             else:
                 if unknown_messages:
-                    unknown_message_records.append({"type": mesg_type, "raw_type": record.mesg_type, "record": raw})
+                    unknown_message_records.append({"type": mesg_type, "record": raw})
 
 
     fit_df = pd.DataFrame(records)
+    sport_df = pd.DataFrame(sport_records)
 
     session_summaries = process_summaries(session_summaries)
     lap_summaries = process_summaries(lap_summaries)
@@ -244,7 +256,7 @@ def read_fit(
         session_end = pd.Timestamp.max.tz_localize("UTC")
         if not session_summaries.empty:
             for session, session_start in (
-                session_summaries["start_time"].sort_index(ascending=False).iteritems()
+                session_summaries["start_time"].sort_index(ascending=False).items()
             ):
                 fit_df.loc[
                     (fit_df.index >= session_start) & (fit_df.index < session_end),
@@ -260,7 +272,7 @@ def read_fit(
                     for lap, lap_start in (
                         laps_in_session["start_time"]
                         .sort_index(ascending=False)
-                        .iteritems()
+                        .items()
                     ):
                         fit_df.loc[
                             (fit_df.index >= lap_start) & (fit_df.index < lap_end),
@@ -289,7 +301,7 @@ def read_fit(
     }
 
     if hrv:
-        return_value["hrv"] = pd.Series(rr_intervals, name="RR interval")
+        return_value["hrv"] = pd.Series(rr_intervals, name="RR interval", dtype="float64")
 
     if pool_lengths:
         pool_length_df = pd.DataFrame(pool_length_records)
@@ -305,6 +317,7 @@ def read_fit(
         return_value["sessions"] = session_summaries
         return_value["laps"] = lap_summaries
         return_value["activity"] = activity_summary
+        return_value["sports"] = sport_df
 
     if metadata:
         return_value["devices"] = devices
